@@ -94,6 +94,7 @@ Note: '/' also used in filename in get_columns(). */
 #define CSUFFIXLEN MYSTRLEN(CONTROLFILESUFFIX)
 #define DEFAULTCOLUMNS 80
 #define MAXLEN 255     /* Maximum character width */
+#define UTF8CELL 10    /* Bytes reserved for one UTF-8 encoded character */
 
 /* Add support for Sam Hocevar's TOIlet fonts */
 #ifdef TLF_FONTS
@@ -230,8 +231,11 @@ char *fontdirname,*fontname;
 
 ****************************************************************************/
 
+/* Metrics parsed from the current font header, shared by the
+   font-loading routines below. */
 char hardblank;
 int charheight;
+int maxlen;      /* widest line any FIGcharacter occupies */
 
 
 /****************************************************************************
@@ -697,32 +701,36 @@ ZFILE *FIGopen(name,suffix)
 char *name;
 char *suffix;
 {
-  char *fontpath;
+  char *path;
   ZFILE *fontfile;
   struct stat st;
-  int namelen;
+  int dirlen;
 
-  namelen = MYSTRLEN(fontdirname);
-  fontpath = (char*)alloca(sizeof(char)*
-    (namelen+MYSTRLEN(name)+MYSTRLEN(suffix)+2));
+  /* Reserve room for "<dir><sep><name><suffix>" plus a terminator. */
+  dirlen = MYSTRLEN(fontdirname);
+  path = (char*)alloca(sizeof(char)*
+    (dirlen+MYSTRLEN(name)+MYSTRLEN(suffix)+2));
   fontfile = NULL;
+
+  /* A bare name is resolved under the font directory first. */
   if (!hasdirsep(name)) {  /* not a full path name */
-    strcpy(fontpath,fontdirname);
-    fontpath[namelen] = DIRSEP;
-    fontpath[namelen+1] = '\0';
-    strcat(fontpath,name);
-    strcat(fontpath,suffix);
-    if(stat(fontpath,&st)==0) goto ok;
+    strcpy(path,fontdirname);
+    path[dirlen] = DIRSEP;
+    path[dirlen+1] = '\0';
+    strcat(path,name);
+    strcat(path,suffix);
+    if(stat(path,&st)==0) goto ok;
     }
-  /* just append suffix */
-  strcpy(fontpath,name);
-  strcat(fontpath,suffix);
-  if(stat(fontpath,&st)==0) goto ok;
+
+  /* Otherwise treat the name as a path and simply append the suffix. */
+  strcpy(path,name);
+  strcat(path,suffix);
+  if(stat(path,&st)==0) goto ok;
 
   return NULL;
 
 ok:
-  fontfile = Zopen(fontpath,"rb");
+  fontfile = Zopen(path,"rb");
   return fontfile;
 }
 
@@ -1119,6 +1127,26 @@ void clearline()
 
 /****************************************************************************
 
+  storerow
+
+  Allocates a cell of the given width for one row of a FIGcharacter and
+  copies the row into it.
+
+****************************************************************************/
+
+outchr *storerow(text,width)
+outchr *text;
+int width;
+{
+  outchr *cell;
+
+  cell = (outchr*)myalloc(sizeof(outchr)*(width+1));
+  STRCPY(cell,text);
+  return cell;
+}
+
+/****************************************************************************
+
   readfontchar
 
   Reads a font character from the font file, and places it in a
@@ -1130,41 +1158,49 @@ void readfontchar(file,theord)
 ZFILE *file;
 inchr theord;
 {
-  int row,k;
-  char templine[MAXLEN+1];
-  outchr endchar, outline[MAXLEN+1];
-  fcharnode *fclsave;
+  int row,col,width;
+  char rawline[MAXLEN+1];
+  outchr mark, glyph[MAXLEN+1];
+  fcharnode *prev;
 
-  fclsave = fcharlist;
+  /* Link a fresh entry for this character onto the front of the list. */
+  prev = fcharlist;
   fcharlist = (fcharnode*)myalloc(sizeof(fcharnode));
   fcharlist->ord = theord;
   fcharlist->thechar = (outchr**)myalloc(sizeof(outchr*)*charheight);
-  fcharlist->next = fclsave;
+  fcharlist->next = prev;
 
-  outline[0] = 0;
+  glyph[0] = 0;
 
   for (row=0;row<charheight;row++) {
-    if (myfgets(templine,MAXLEN,file)==NULL) {
-      templine[0] = '\0';
+    if (myfgets(rawline,MAXLEN,file)==NULL) {
+      rawline[0] = '\0';
       }
 #ifdef TLF_FONTS
-    utf8_to_wchar(templine,MAXLEN,outline,MAXLEN,0);
+    utf8_to_wchar(rawline,MAXLEN,glyph,MAXLEN,0);
 #else
-    strcpy(outline,templine);
+    strcpy(glyph,rawline);
 #endif
-    k = STRLEN(outline)-1;
-    while (k>=0 && ISSPACE(outline[k])) {  /* remove trailing spaces */
-      k--;
+
+    /* Trim trailing blanks, then the run of endmark characters. */
+    col = STRLEN(glyph)-1;
+    while (col>=0 && ISSPACE(glyph[col])) {
+      col--;
       }
-    if (k>=0) {
-      endchar = outline[k];  /* remove endmarks */
-      while (k>=0 && outline[k]==endchar) {
-        k--;
+    if (col>=0) {
+      mark = glyph[col];
+      while (col>=0 && glyph[col]==mark) {
+        col--;
         }
       }
-    outline[k+1] = '\0';
-    fcharlist->thechar[row] = (outchr*)myalloc(sizeof(outchr)*(STRLEN(outline)+1));
-    STRCPY(fcharlist->thechar[row],outline);
+    glyph[col+1] = '\0';
+
+    /* keep the row within the font's declared cell width */
+    width = STRLEN(glyph);
+    if (width > maxlen) {
+      width = maxlen;
+      }
+    fcharlist->thechar[row] = storerow(glyph,width);
     }
 }
 
@@ -1182,9 +1218,9 @@ void readfont()
 {
   int i,row,numsread;
   inchr theord;
-  int maxlen,cmtlines,ffright2left;
+  int cmtlines,ffright2left;
   int smush,smush2;
-  char fileline[MAXLEN+1],magicnum[5];
+  char linebuf[MAXLEN+1],magicnum[5];
   ZFILE *fontfile;
 
   fontfile = FIGopen(fontname,FONTFILESUFFIX);
@@ -1201,13 +1237,13 @@ void readfont()
     }
 
   readmagic(fontfile,magicnum);
-  if (myfgets(fileline,MAXLEN,fontfile)==NULL) {
-    fileline[0] = '\0';
+  if (myfgets(linebuf,MAXLEN,fontfile)==NULL) {
+    linebuf[0] = '\0';
     }
-  if (MYSTRLEN(fileline)>0 ? fileline[MYSTRLEN(fileline)-1]!='\n' : 0) {
+  if (MYSTRLEN(linebuf)>0 ? linebuf[MYSTRLEN(linebuf)-1]!='\n' : 0) {
     skiptoeol(fontfile);
     }
-  numsread = sscanf(fileline,"%*c%c %d %*d %d %d %d %d %d",
+  numsread = sscanf(linebuf,"%*c%c %d %*d %d %d %d %d %d",
     &hardblank,&charheight,&maxlen,&smush,&cmtlines,
     &ffright2left,&smush2);
 
@@ -1276,8 +1312,10 @@ void readfont()
   for (theord=0;theord<=6;theord++) {
     readfontchar(fontfile,deutsch[theord]);
     }
-  while (myfgets(fileline,maxlen+1,fontfile)==NULL?0:
-    sscanf(fileline,"%li",&theord)==1) {
+  /* Read any code-tagged (non-ASCII) character definitions that follow;
+     each begins with a line giving the character's numeric code. */
+  while (myfgets(linebuf,maxlen+1,fontfile)==NULL?0:
+    sscanf(linebuf,"%li",&theord)==1) {
     readfontchar(fontfile,theord);
     }
   Zclose(fontfile);
@@ -1319,17 +1357,17 @@ void linealloc()
 void getletter(c)
 inchr c;
 {
-  fcharnode *charptr;
+  fcharnode *cnode;
 
-  for (charptr=fcharlist;charptr==NULL?0:charptr->ord!=c;
-    charptr=charptr->next) ;
-  if (charptr!=NULL) {
-    currchar = charptr->thechar;
+  for (cnode=fcharlist;cnode==NULL?0:cnode->ord!=c;
+    cnode=cnode->next) ;
+  if (cnode!=NULL) {
+    currchar = cnode->thechar;
     }
   else {
-    for (charptr=fcharlist;charptr==NULL?0:charptr->ord!=0;
-      charptr=charptr->next) ;
-    currchar = charptr->thechar;
+    for (cnode=fcharlist;cnode==NULL?0:cnode->ord!=0;
+      cnode=cnode->next) ;
+    currchar = cnode->thechar;
     }
   previouscharwidth = currcharwidth;
   currcharwidth = STRLEN(currchar[0]);
@@ -1445,29 +1483,29 @@ outchr lch,rch;
 
 int smushamt()
 {
-  int maxsmush,amt;
-  int row,linebd,charbd;
+  int smushmax,amt;
+  int row,linebound,charbound;
   outchr ch1,ch2;
 
   if ((smushmode & (SM_SMUSH | SM_KERN)) == 0) {
     return 0;
     }
-  maxsmush = currcharwidth;
+  smushmax = currcharwidth;
   for (row=0;row<charheight;row++) {
     if (right2left) {
-      if (maxsmush>STRLEN(outputline[row])) {
-        maxsmush=STRLEN(outputline[row]);
+      if (smushmax>STRLEN(outputline[row])) {
+        smushmax=STRLEN(outputline[row]);
         }
-      for (charbd=STRLEN(currchar[row]);
-        ch1=currchar[row][charbd],(charbd>0&&(!ch1||ch1==' '));charbd--) ;
-      for (linebd=0;ch2=outputline[row][linebd],ch2==' ';linebd++) ;
-      amt = linebd+currcharwidth-1-charbd;
+      for (charbound=STRLEN(currchar[row]);
+        ch1=currchar[row][charbound],(charbound>0&&(!ch1||ch1==' '));charbound--) ;
+      for (linebound=0;ch2=outputline[row][linebound],ch2==' ';linebound++) ;
+      amt = linebound+currcharwidth-1-charbound;
       }
     else {
-      for (linebd=STRLEN(outputline[row]);
-        ch1 = outputline[row][linebd],(linebd>0&&(!ch1||ch1==' '));linebd--) ;
-      for (charbd=0;ch2=currchar[row][charbd],ch2==' ';charbd++) ;
-      amt = charbd+outlinelen-1-linebd;
+      for (linebound=STRLEN(outputline[row]);
+        ch1 = outputline[row][linebound],(linebound>0&&(!ch1||ch1==' '));linebound--) ;
+      for (charbound=0;ch2=currchar[row][charbound],ch2==' ';charbound++) ;
+      amt = charbound+outlinelen-1-linebound;
       }
     if (!ch1||ch1==' ') {
       amt++;
@@ -1477,11 +1515,11 @@ int smushamt()
         amt++;
         }
       }
-    if (amt<maxsmush) {
-      maxsmush = amt;
+    if (amt<smushmax) {
+      smushmax = amt;
       }
     }
-  return maxsmush;
+  return smushmax;
 }
 
 
@@ -1497,40 +1535,40 @@ int smushamt()
 int addchar(c)
 inchr c;
 {
-  int smushamount,row,k,column;
-  outchr *templine;
+  int overlap,row,k,column;
+  outchr *merged;
 
   getletter(c);
-  smushamount = smushamt();
-  if (outlinelen+currcharwidth-smushamount>outlinelenlimit
+  overlap = smushamt();
+  if (outlinelen+currcharwidth-overlap>outlinelenlimit
       ||inchrlinelen+1>inchrlinelenlimit) {
     return 0;
     }
 
-  templine = (outchr*)myalloc(sizeof(outchr)*(outlinelenlimit+1));
+  merged = (outchr*)myalloc(sizeof(outchr)*(outlinelenlimit+1));
   for (row=0;row<charheight;row++) {
     if (right2left) {
-      STRCPY(templine,currchar[row]);
-      for (k=0;k<smushamount;k++) {
-        templine[currcharwidth-smushamount+k] =
-          smushem(templine[currcharwidth-smushamount+k],outputline[row][k]);
+      STRCPY(merged,currchar[row]);
+      for (k=0;k<overlap;k++) {
+        merged[currcharwidth-overlap+k] =
+          smushem(merged[currcharwidth-overlap+k],outputline[row][k]);
         }
-      STRCAT(templine,outputline[row]+smushamount);
-      STRCPY(outputline[row],templine);
+      STRCAT(merged,outputline[row]+overlap);
+      STRCPY(outputline[row],merged);
       }
     else {
-      for (k=0;k<smushamount;k++) {
-	column = outlinelen-smushamount+k;
+      for (k=0;k<overlap;k++) {
+	column = outlinelen-overlap+k;
 	if (column < 0) {
 	  column = 0;
 	  }
         outputline[row][column] =
           smushem(outputline[row][column],currchar[row][k]);
         }
-      STRCAT(outputline[row],currchar[row]+smushamount);
+      STRCAT(outputline[row],currchar[row]+overlap);
       }
     }
-  free(templine);
+  free(merged);
   outlinelen = STRLEN(outputline[0]);
   inchrline[inchrlinelen++] = c;
   return 1;
@@ -1554,7 +1592,7 @@ void putstring(string)
 outchr *string;
 {
   int i,len;
-  char c[10];
+  char c[UTF8CELL];
 #ifdef TLF_FONTS
   size_t size;
   wchar_t wc[2];
@@ -1575,11 +1613,9 @@ outchr *string;
 #ifdef TLF_FONTS
     wc[0] = string[i];
     wc[1] = 0;
-    size = wchar_to_utf8(wc,1,c,10,0);
-    if(size==1) {
-      if(c[0]==hardblank) {
-        c[0] = ' ';
-        }
+    size = wchar_to_utf8(wc,1,c,UTF8CELL,0);
+    if(size==1 && c[0]==hardblank) {
+      c[0] = ' ';
       }
     c[size] = 0;
     printf("%s",c);
@@ -1622,40 +1658,40 @@ void printline()
 
 void splitline()
 {
-  int i,gotspace,lastspace,len1,len2;
-  inchr *part1,*part2;
+  int i,seen,brk,len1,len2;
+  inchr *head,*tail;
 
-  part1 = (inchr*)myalloc(sizeof(inchr)*(inchrlinelen+1));
-  part2 = (inchr*)myalloc(sizeof(inchr)*(inchrlinelen+1));
-  gotspace = 0;
-  lastspace = inchrlinelen-1;
+  head = (inchr*)myalloc(sizeof(inchr)*(inchrlinelen+1));
+  tail = (inchr*)myalloc(sizeof(inchr)*(inchrlinelen+1));
+  seen = 0;
+  brk = inchrlinelen-1;
   for (i=inchrlinelen-1;i>=0;i--) {
-    if (!gotspace && inchrline[i]==' ') {
-      gotspace = 1;
-      lastspace = i;
+    if (!seen && inchrline[i]==' ') {
+      seen = 1;
+      brk = i;
       }
-    if (gotspace && inchrline[i]!=' ') {
+    if (seen && inchrline[i]!=' ') {
       break;
       }
     }
   len1 = i+1;
-  len2 = inchrlinelen-lastspace-1;
+  len2 = inchrlinelen-brk-1;
   for (i=0;i<len1;i++) {
-    part1[i] = inchrline[i];
+    head[i] = inchrline[i];
     }
   for (i=0;i<len2;i++) {
-    part2[i] = inchrline[lastspace+1+i];
+    tail[i] = inchrline[brk+1+i];
     }
   clearline();
   for (i=0;i<len1;i++) {
-    addchar(part1[i]);
+    addchar(head[i]);
     }
   printline();
   for (i=0;i<len2;i++) {
-    addchar(part2[i]);
+    addchar(tail[i]);
     }
-  free(part1);
-  free(part2);
+  free(head);
+  free(tail);
 }
 
 
@@ -1671,19 +1707,19 @@ void splitline()
 inchr handlemapping(c)
 inchr c;
 {
-  comnode *cmptr;
+  comnode *node;
 
-  cmptr=commandlist;
-  while (cmptr!=NULL) {
-    if (cmptr->thecommand ?
-      (c >= cmptr->rangelo && c <= cmptr->rangehi) : 0) {
-      c += cmptr->offset;
-      while(cmptr!=NULL ? cmptr->thecommand : 0) {
-        cmptr=cmptr->next;
+  for (node=commandlist; node!=NULL; ) {
+    if (node->thecommand && c>=node->rangelo && c<=node->rangehi) {
+      /* Character falls in this mapping range; apply the offset and
+         skip past the rest of this (frozen) command block. */
+      c += node->offset;
+      while (node!=NULL && node->thecommand) {
+        node = node->next;
         }
       }
     else {
-      cmptr=cmptr->next;
+      node = node->next;
       }
     }
   return c;
